@@ -751,29 +751,66 @@ func newDesc(subsystem, name, help string) *prometheus.Desc {
 // Query the pg_settings view containing runtime variables
 func querySettings(ch chan<- prometheus.Metric, db *sql.DB) error {
 	log.Debugln("Querying pg_setting view")
-
 	subsystem := "settings"
 
-	// FIXME: Require 8.2+: https://www.postgresql.org/docs/8.2/static/view-pg-settings.html
-	rows, err := db.Query("SELECT name, setting::double precision, short_desc FROM pg_settings WHERE vartype IN ('integer', 'real');")
+	// FIXME(mbostock): Add support for booleans
+	// pg_settings docs: https://www.postgresql.org/docs/current/static/view-pg-settings.html
+	query := "SELECT name, setting::double precision, COALESCE(unit, ''), short_desc FROM pg_settings WHERE vartype IN ('integer', 'real');"
+
+	rows, err := db.Query(query)
 	if err != nil {
 		return errors.New(fmt.Sprintln("Error running query on database: ", namespace, err))
 	}
 	defer rows.Close()
 
-	var name, setting, shortDesc string
+	var name, setting, unit, shortDesc string
 	for rows.Next() {
-		err = rows.Scan(&name, &setting, &shortDesc)
+		err = rows.Scan(&name, &setting, &unit, &shortDesc)
 		if err != nil {
 			return errors.New(fmt.Sprintln("Error retrieving rows:", namespace, err))
 		}
 
-		desc := newDesc(subsystem, name, shortDesc)
 		val, err := strconv.ParseFloat(setting, 64)
 		if err != nil {
 			return errors.New(fmt.Sprintf("Error converting setting %q value %q to float: %s", name, setting, err))
 		}
 
+		var suffix string
+		switch unit {
+		case "":
+		case "min":
+			suffix = "minimum"
+		case "s":
+			suffix = "seconds"
+		case "ms":
+			suffix = "seconds"
+			// -1 is special
+			if val > 0 {
+				val /= 1000
+			}
+		case "kB":
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= 1000
+			}
+		case "8kB":
+			// Do nothing for 8kB; these metrics really use pages for units
+			// The short description for these metrics talks about pages
+		case "16MB":
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= 1.6e9
+			}
+		default:
+			return errors.New(fmt.Sprintf("Unknown unit %q for runtime variable %q", val, name))
+		}
+
+		if len(suffix) > 0 {
+			name = fmt.Sprintf("%s_%s", name, suffix)
+		}
+		desc := newDesc(subsystem, name, shortDesc)
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
 	}
 
