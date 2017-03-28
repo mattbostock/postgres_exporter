@@ -753,9 +753,8 @@ func querySettings(ch chan<- prometheus.Metric, db *sql.DB) error {
 	log.Debugln("Querying pg_setting view")
 	subsystem := "settings"
 
-	// FIXME(mbostock): Add support for booleans
 	// pg_settings docs: https://www.postgresql.org/docs/current/static/view-pg-settings.html
-	query := "SELECT name, setting::double precision, COALESCE(unit, ''), short_desc FROM pg_settings WHERE vartype IN ('integer', 'real');"
+	query := "SELECT name, setting, COALESCE(unit, ''), short_desc, vartype FROM pg_settings WHERE vartype IN ('bool', 'integer', 'real');"
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -763,11 +762,22 @@ func querySettings(ch chan<- prometheus.Metric, db *sql.DB) error {
 	}
 	defer rows.Close()
 
-	var name, setting, unit, shortDesc string
+	var name, setting, unit, shortDesc, vartype string
 	for rows.Next() {
-		err = rows.Scan(&name, &setting, &unit, &shortDesc)
+		err = rows.Scan(&name, &setting, &unit, &shortDesc, &vartype)
 		if err != nil {
 			return errors.New(fmt.Sprintln("Error retrieving rows:", namespace, err))
+		}
+
+		if vartype == "bool" {
+			var val float64
+			if setting == "on" {
+				val = 1
+			}
+
+			desc := newDesc(subsystem, name, shortDesc)
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
+			continue
 		}
 
 		val, err := strconv.ParseFloat(setting, 64)
@@ -776,32 +786,71 @@ func querySettings(ch chan<- prometheus.Metric, db *sql.DB) error {
 		}
 
 		var suffix string
+		// Units defined in: https://www.postgresql.org/docs/current/static/config-setting.html
 		switch unit {
 		case "":
-		case "min":
-			suffix = "minimum"
-		case "s":
-			suffix = "seconds"
+			// Do nothing, no conversion required
 		case "ms":
 			suffix = "seconds"
 			// -1 is special
 			if val > 0 {
 				val /= 1000
 			}
+		case "s":
+			suffix = "seconds"
+		case "min":
+			suffix = "seconds"
+			// -1 is special
+			if val > 0 {
+				val *= 60
+			}
+		case "h":
+			suffix = "seconds"
+			// -1 is special
+			if val > 0 {
+				val *= 60 * 60
+			}
+		case "d":
+			suffix = "seconds"
+			// -1 is special
+			if val > 0 {
+				val *= 60 * 60 * 24
+			}
 		case "kB":
 			suffix = "bytes"
 			// -1 is special
 			if val > 0 {
-				val *= 1000
+				val *= math.Pow(2, 10)
+			}
+		case "MB":
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= math.Pow(2, 20)
+			}
+		case "GB":
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= math.Pow(2, 30)
+			}
+		case "TB":
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= math.Pow(2, 40)
 			}
 		case "8kB":
-			// Do nothing for 8kB; these metrics really use pages for units
-			// The short description for these metrics talks about pages
+			suffix = "bytes"
+			// -1 is special
+			if val > 0 {
+				val *= math.Pow(2, 13)
+			}
 		case "16MB":
 			suffix = "bytes"
 			// -1 is special
 			if val > 0 {
-				val *= 1.6e9
+				val *= math.Pow(2, 24)
 			}
 		default:
 			return errors.New(fmt.Sprintf("Unknown unit %q for runtime variable %q", val, name))
@@ -809,7 +858,9 @@ func querySettings(ch chan<- prometheus.Metric, db *sql.DB) error {
 
 		if len(suffix) > 0 {
 			name = fmt.Sprintf("%s_%s", name, suffix)
+			shortDesc = fmt.Sprintf("%s [Converted to %s.]", shortDesc, suffix)
 		}
+
 		desc := newDesc(subsystem, name, shortDesc)
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val)
 	}
